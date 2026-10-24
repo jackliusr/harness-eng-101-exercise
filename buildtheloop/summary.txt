@@ -1,1 +1,1 @@
-Summary: notes.txt describes Loop as a tiny coding agent experiment.
+Summary: notes.txt contains a brief statement about "Loop" being a tiny coding agent experiment.
