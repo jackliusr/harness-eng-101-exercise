@@ -1,6 +1,8 @@
+import argparse
 import json
 import os
 from pathlib import Path
+import sys
 
 from openai import OpenAI
 
@@ -15,7 +17,7 @@ MAX_TURNS = 12
 MAX_TOOL_CALLS = 24
 
 client = OpenAI(base_url=BASE_URL, api_key=API_KEY)
-
+session_approvals: set[str] = set()
 
 IGNORED_NAMES = {
     ".git",
@@ -245,10 +247,26 @@ def check_policy(name: str, arguments: dict) -> dict:
 
     return allow()
 
-def policy_to_tool_result(name: str, policy: dict) -> dict:
-    if policy["decision"] == "allow":
-        return {"ok": True}
+def prompt_for_approval(policy: dict) -> bool:
+    rule_hint = policy.get("rule_hint")
+    if rule_hint in session_approvals:
+        return True
 
+    print("\nApproval needed")
+    print(policy["message"])
+    print(f"Risk: {policy.get('risk', 'unknown')}")
+    print("\nAllow?")
+    print("  y  yes, once")
+    print("  s  yes, for this session")
+    print("  n  no")
+
+    choice = input("> ").strip().lower()
+    if choice == "s" and rule_hint:
+        session_approvals.add(rule_hint)
+        return True
+    return choice == "y"
+
+def policy_to_tool_result(name: str, policy: dict) -> dict:
     return {
         "ok": False,
         "tool": name,
@@ -260,6 +278,7 @@ def policy_to_tool_result(name: str, policy: dict) -> dict:
         "rule_hint": policy.get("rule_hint"),
         "approval_scopes": policy.get("approval_scopes", []),
     }
+
 
 def normalize_result(name: str, result) -> dict:
     return {"ok": True, "tool": name, "result": result}
@@ -286,17 +305,17 @@ def handle_tool_call(tool_call) -> dict:
         arguments = parse_arguments(tool_call.function.arguments)
         validate_tool_call(name, arguments)
         policy = check_policy(name, arguments)
-        if not policy["ok"]:
-            return policy
+
+        if policy["decision"] == "deny":
+            return policy_to_tool_result(name, policy)
+
+        if policy["decision"] == "ask" and not prompt_for_approval(policy):
+            return policy_to_tool_result(name, policy)
+
         result = execute_tool(name, arguments)
         return normalize_result(name, result)
     except ToolError as error:
         return error_result(name, error)
-    except Exception as error:
-        return error_result(
-            name,
-            ToolError("tool_failure", f"{type(error).__name__}: {error}", False),
-        )
 
 
 def log_event(event: dict) -> None:
@@ -313,7 +332,18 @@ def call_model(messages: list[dict]):
     return response.choices[0].message
 
 
-def run_agent(messages: list[dict]) -> dict:
+def run_agent(task: str) -> dict:
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a tiny coding agent. Use tools when you need to inspect "
+                "or change the workspace. Paths must stay inside the workspace. "
+                "When you have enough information, answer clearly."
+            ),
+        },
+        {"role": "user", "content": task},
+    ]    
     tool_call_count = 0
     stop_reason = "max_turns"
 
@@ -365,24 +395,37 @@ def run_agent(messages: list[dict]) -> dict:
     }
 
 
-messages = [
-    {
-        "role": "system",
-        "content": (
-            "You are a tiny coding agent. Use tools when you need to inspect "
-            "or change the workspace. Paths must stay inside the workspace. "
-            "When you have enough information, answer clearly."
-        ),
-    },
-    {
-        "role": "user",
-        "content": (
-            "Inspect notes.txt, then write a short summary to summary.txt. "
-            "After writing it, read summary.txt back to confirm what you wrote."
-        ),
-    },
-]
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run the tiny coding agent loop.")
+    parser.add_argument("task", help="The task for the agent to perform.")
+    parser.add_argument(
+        "--workspace",
+        default=".",
+        help="Workspace directory the agent can inspect and edit.",
+    )
+    return parser.parse_args()
 
 
-result = run_agent(messages)
-print(f"Stopped because: {result['stop_reason']}")
+def main() -> int:
+    global WORKSPACE
+
+    args = parse_args()
+    WORKSPACE = Path(args.workspace).expanduser().resolve()
+    if not WORKSPACE.exists() or not WORKSPACE.is_dir():
+        print(f"Workspace does not exist: {WORKSPACE}", file=sys.stderr)
+        return 3
+
+    print(f"Workspace: {WORKSPACE}")
+    result = run_agent(args.task)
+    print(f"\nStopped because: {result['stop_reason']}")
+
+    if result["stop_reason"] == "final_answer":
+        return 0
+    if result["stop_reason"] in {"max_turns", "tool_budget_exceeded"}:
+        return 2
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
