@@ -1,0 +1,1 @@
+Summary: notes.txt describes Loop as a tiny coding agent experiment.
