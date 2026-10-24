@@ -185,19 +185,81 @@ def validate_tool_call(name: str, arguments: dict) -> None:
     require(arguments, *REQUIRED_ARGUMENTS[name])
 
 
-def check_policy(name: str, arguments: dict) -> dict:
-    if name == "write_file":
-        target = safe_path(arguments["path"])
-        if target.is_relative_to(INTERNAL_DIR):
-            return {
-                "ok": False,
-                "tool": name,
-                "error_type": "permission",
-                "message": "The agent may not write into .loop internal state.",
-                "retryable": False,
-            }
-    return {"ok": True}
+SENSITIVE_PATHS = (
+    ".env",
+    "secrets/",
+)
 
+INTERNAL_PATHS = (
+    ".loop/",
+)
+
+SOURCE_PATHS = (
+    "src/",
+    "tests/",
+)
+
+def allow() -> dict:
+    return {"decision": "allow"}
+
+
+def deny(message: str) -> dict:
+    return {
+        "decision": "deny",
+        "message": message,
+        "retryable": False,
+    }
+
+
+def ask(message: str, risk: str, rule_hint: str) -> dict:
+    return {
+        "decision": "ask",
+        "message": message,
+        "risk": risk,
+        "rule_hint": rule_hint,
+        "approval_scopes": ["once", "session", "always"],
+        "retryable": False,
+    }
+def path_starts_with(path: str, prefixes: tuple[str, ...]) -> bool:
+    return any(path == prefix.rstrip("/") or path.startswith(prefix) for prefix in prefixes)
+
+
+def check_policy(name: str, arguments: dict) -> dict:
+    path = arguments.get("path", "")
+
+    if name == "read_file" and path_starts_with(path, SENSITIVE_PATHS):
+        return deny("The agent may not read sensitive files.")
+
+    if name == "write_file" and path_starts_with(path, INTERNAL_PATHS):
+        return deny("The agent may not write internal loop state.")
+
+    if name == "write_file" and path_starts_with(path, SENSITIVE_PATHS):
+        return deny("The agent may not write secrets.")
+
+    if name == "write_file" and path_starts_with(path, SOURCE_PATHS):
+        return ask(
+            message=f"The agent wants to modify source code: {path}",
+            risk="changes code that may affect behavior",
+            rule_hint=f"write_file:{path}",
+        )
+
+    return allow()
+
+def policy_to_tool_result(name: str, policy: dict) -> dict:
+    if policy["decision"] == "allow":
+        return {"ok": True}
+
+    return {
+        "ok": False,
+        "tool": name,
+        "error_type": "permission",
+        "message": policy["message"],
+        "retryable": policy.get("retryable", False),
+        "needs_approval": policy["decision"] == "ask",
+        "risk": policy.get("risk"),
+        "rule_hint": policy.get("rule_hint"),
+        "approval_scopes": policy.get("approval_scopes", []),
+    }
 
 def normalize_result(name: str, result) -> dict:
     return {"ok": True, "tool": name, "result": result}
